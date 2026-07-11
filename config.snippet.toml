@@ -1,0 +1,11 @@
+# Inline alternative to hooks.json — paste into ~/.codex/config.toml.
+# (Use EITHER hooks.json OR this block, not both.)
+
+[[hooks.PreToolUse]]
+matcher = "Bash|apply_patch|Write|Edit"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "python3 ~/.codex/hooks/intrupt_hook.py"
+timeout = 630
+statusMessage = "Awaiting intrupt approval"
