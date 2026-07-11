@@ -80,7 +80,9 @@ GATED_TOOLS = {
 # Shell commands matching ANY of these patterns require approval.
 # Keep patterns specific to reduce interruption noise.
 SHELL_GATE_PATTERNS: list[str] = [
-    r"\brm\s+\S",                # any rm with an argument (plain delete, -r, -f, ...)
+    # Catastrophic deletions only — home/root/system dirs or a bare */./..  Routine
+    # and project-local deletes (rm file, rm -rf node_modules/build) pass through.
+    r"\brm\b[\s\S]*\s(~/?(\s|$)|\$\{?HOME\}?/?(\s|$)|/(\s|$)|/\*|/(Users|home)/[^/\s]+/?(\s|$)|/(etc|usr|var|bin|sbin|opt|System|Library|private|boot|dev|lib|sys|proc)(/|\s|$)|\*(\s|$)|\.(\s|$)|\.\.(/|\s|$))",
     r"\bgit\s+push\b",             # any git push (including --force)
     r"\bgit\s+reset\s+--hard\b",
     r"\bgh\s+pr\s+merge\b",
@@ -103,7 +105,41 @@ SHELL_GATE_PATTERNS: list[str] = [
 ]
 
 # Compile once at startup
+# User-defined protected paths (AEGMIS_PROTECTED_PATHS) — also gate `rm` of each
+# listed path and anything under it, on top of the built-in catastrophic targets.
+for _pp in os.environ.get("AEGMIS_PROTECTED_PATHS", "").split(","):
+    _pp = _pp.strip().rstrip("/")
+    if _pp:
+        SHELL_GATE_PATTERNS.append(r"\brm\b[\s\S]*\s" + re.escape(_pp) + r"(/|\s|$)")
+
 _COMPILED = [re.compile(p, re.IGNORECASE) for p in SHELL_GATE_PATTERNS]
+
+# Protected paths (AEGMIS_PROTECTED_PATHS) resolved for cwd-aware matching — this
+# catches relative rm targets (./ok, ok, ../x) that literal patterns would miss.
+_STATE = {"cwd": ""}
+_PROTECTED = [
+    __import__("os").path.normpath(__import__("os").path.expanduser(_pp.strip().rstrip("/")))
+    for _pp in os.environ.get("AEGMIS_PROTECTED_PATHS", "").split(",")
+    if _pp.strip()
+]
+
+
+def _rm_hits_protected(command: str) -> bool:
+    """True if an rm target in `command`, resolved against cwd, is a protected path."""
+    if not _PROTECTED or not re.search(r"\brm\b", command):
+        return False
+    for tok in command.split():
+        t = tok.strip("'\"")
+        if not t or t in ("rm", "sudo", "--") or t.startswith("-"):
+            continue
+        t = os.path.expanduser(t)
+        cand = t if os.path.isabs(t) else os.path.normpath(os.path.join(_STATE["cwd"] or ".", t))
+        cand = os.path.normpath(cand).rstrip("/")
+        for prot in _PROTECTED:
+            if cand == prot or cand.startswith(prot + "/"):
+                return True
+    return False
+
 
 # Optional allow-list: patterns whose matching shell commands bypass approval
 _BYPASS_RAW = os.environ.get("AEGMIS_BYPASS_PATTERNS", "")
@@ -191,6 +227,8 @@ def _should_gate_shell(command: str) -> bool:
     """Gate if command matches any SHELL_GATE_PATTERNS and no BYPASS pattern."""
     if _bypassed(command):
         return False
+    if _rm_hits_protected(command):
+        return True
     return any(p.search(command) for p in _COMPILED)
 
 
@@ -210,6 +248,8 @@ def main() -> None:
         payload = json.loads(raw)
     except json.JSONDecodeError:
         _die("Could not parse hook payload from stdin")
+
+    _STATE["cwd"] = payload.get("cwd") or payload.get("working_dir") or ""
 
     tool_name  = payload.get("tool_name", "")
     tool_input = payload.get("tool_input", {})
@@ -264,6 +304,7 @@ def main() -> None:
         "channel":     "slack",
         "tool_name":   tool_name,
         "tool_kwargs": tool_input,
+        "adapter":     "codex",
     })
 
     # The API may decide inline (e.g. auto-approve when no policy matches),

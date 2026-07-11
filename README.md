@@ -102,7 +102,7 @@ Commands that **always require approval**:
 
 | Pattern | Example |
 |---|---|
-| `rm -rf` / `rm -r` | `rm -rf dist/` |
+| **catastrophic delete** (home / root / system dir, or bare `*` `.` `..`) | `rm -rf ~`, `rm -rf /`, `rm -rf /Users/you`, `rm *` — **not** `rm file` or `rm -rf node_modules` |
 | `git push` | `git push origin main --force` |
 | `git reset --hard` | `git reset --hard HEAD~3` |
 | `gh pr merge` / `gh release` | `gh pr merge 42` |
@@ -177,6 +177,7 @@ All configuration is via environment variables.
 | `AEGMIS_TIMEOUT` | no | `600` | Max seconds to wait for a decision |
 | `AEGMIS_POLL_INTERVAL` | no | `5` | Seconds between status polls |
 | `AEGMIS_BYPASS_PATTERNS` | no | — | Comma-separated regex patterns; matching shell commands skip approval |
+| `AEGMIS_PROTECTED_PATHS` | no | — | Comma-separated dirs to also gate `rm` on (dir + subtree), on top of built-in home/root/system targets |
 
 > **Hook timeout:** Codex hook `timeout` is in **seconds**. The bundled config
 > sets `630` so it exceeds `AEGMIS_TIMEOUT` (600 s). If you raise
@@ -227,6 +228,37 @@ Prefer inline TOML? Paste `config.snippet.toml` into `~/.codex/config.toml` inst
 
 ---
 
+## Example: catastrophic-deletion gate + protecting your own paths
+
+In **local mode** (`AEGMIS_FORWARD_ALL=false`) the hook gates only *catastrophic*
+deletions and lets routine ones run untouched:
+
+```bash
+rm abc.txt                 # runs   — routine single-file delete
+rm -rf node_modules        # runs   — project-local
+rm -rf ~                   # ⛔ approval — wipes home
+rm -rf /                   # ⛔ approval — wipes root
+rm *                       # ⛔ approval — bare glob
+```
+
+To also require approval before deleting **specific dirs of yours**, list them:
+
+```bash
+export AEGMIS_PROTECTED_PATHS=/Users/you/work,/Users/you/important
+```
+
+Targets are resolved against the command's working directory, so relative refs are
+caught too:
+
+```bash
+# with AEGMIS_PROTECTED_PATHS=/Users/you/work
+cd /Users/you && rm -rf ./work     # ⛔ approval  (./work → /Users/you/work)
+rm -rf /Users/you/work/build       # ⛔ approval  (under a protected dir)
+rm -rf /Users/you/other            # runs        — not protected
+```
+
+---
+
 ## Testing
 
 Run the included smoke tests — no real API credentials needed:
@@ -240,7 +272,7 @@ Expected output:
 ```
 [PASS] Bash — git push (gated)
 [PASS] Bash — ls (allowed)
-[PASS] Bash — rm -rf (gated)
+[PASS] Bash — rm -rf ~ (catastrophic, gated)
 [PASS] Bash — git status (allowed)
 [PASS] apply_patch — file edit (gated)
 [PASS] read (unknown tool) — not gated

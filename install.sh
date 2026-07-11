@@ -108,6 +108,7 @@ export AEGMIS_APPROVAL=true          # set false to disable the gate entirely
 export AEGMIS_GATED_TOOLS=Bash,apply_patch
 export AEGMIS_TIMEOUT=600
 export AEGMIS_POLL_INTERVAL=5
+# AEGMIS_PROTECTED_PATHS=/Users/you/work,/data   # extra dirs to gate rm on
 EOF
   echo ""
   echo "   Edit $ENV_FILE and fill in your AEGMIS_API_KEY."
