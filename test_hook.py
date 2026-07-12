@@ -103,8 +103,37 @@ for desc, payload, expect_gated in CASES:
         if result.stderr:
             print(f"       stderr: {result.stderr.strip()}")
 
+# ── Hard-block (AEGMIS_BLOCKED_PATHS) — deny locally, no approval round-trip ──────
+# A hard-blocked rm must emit a codex "deny" decision whose reason names
+# AEGMIS_BLOCKED_PATHS, WITHOUT ever contacting the (dead) API.
+HARD_ENV = {**TEST_ENV, "AEGMIS_BLOCKED_PATHS": os.path.expanduser("~/keepsafe")}
+HARD_CASES = [
+    # (description, command, expect_hard_blocked)
+    ("Bash — rm of hard-blocked dir (denied locally)",       "rm -rf ~/keepsafe",         True),
+    ("Bash — rm of file under hard-blocked dir (denied)",    "rm ~/keepsafe/secrets.txt", True),
+    ("Bash — rm elsewhere (not hard-blocked)",               "rm -rf ~/other/tmp",        False),
+]
+for desc, cmd, expect_blocked in HARD_CASES:
+    result = subprocess.run(
+        [sys.executable, HOOK],
+        input=json.dumps({"cwd": os.path.expanduser("~"),
+                          "tool_name": "Bash", "tool_input": {"command": cmd}}),
+        capture_output=True, text=True, env=HARD_ENV,
+    )
+    hard_blocked = _is_gated(result.stdout) and "AEGMIS_BLOCKED_PATHS" in result.stdout
+    ok = hard_blocked == expect_blocked
+    status = "PASS" if ok else "FAIL"
+    if ok:
+        pass_count += 1
+    else:
+        fail_count += 1
+    print(f"[{status}] {desc}")
+    if not ok:
+        print(f"       expected hard_blocked={expect_blocked}, got {hard_blocked}")
+        print(f"       stdout: {result.stdout.strip()!r}")
+
 print()
-print(f"Results: {pass_count}/{len(CASES)} passed", end="")
+print(f"Results: {pass_count}/{pass_count + fail_count} passed", end="")
 if fail_count:
     print(f", {fail_count} failed")
     sys.exit(1)
