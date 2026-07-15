@@ -3,7 +3,40 @@
 All notable changes to `codex-intrupt-hook` are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com); dates are ISO-8601.
 
-## [0.1.0] - 2026-07-12
+## [0.0.5] - 2026-07-15
+
+### Added
+- **Installer version/feature check** — `install.sh` detects the Codex version and
+  refuses (overridable with `AEGMIS_SKIP_VERSION_CHECK=1`) on builds too old to support
+  `PreToolUse` hooks, where the gate would otherwise be silently inactive.
+- **Whole-project delete gate** — an `rm` / `find` whose resolved target is the working
+  directory, an ancestor of it, or `/` is gated (`rm -rf .`, `rm -rf "$HOME"`, `$PWD`,
+  `..`). Deleting a subdir (`rm -rf build`) still runs free.
+- **Protected-path WRITE gate** — a write/create verb (`touch`, `tee`, `cp`, `mv`,
+  `install`, `dd`, `ln`, or `>` / `>>`) targeting a path under `AEGMIS_PROTECTED_PATHS`
+  is gated. Opt-in and directory-scoped; writes elsewhere and all reads run free.
+- **Self-protection** — mutating shell commands touching the hook's own config
+  (`~/.codex/…`, `.git/hooks`) are always gated, regardless of `AEGMIS_GATED_TOOLS`.
+- Broader denylist: exfiltration (`gh repo/gist create`, `git remote add/set-url`,
+  `curl --data-binary/-T/-F`, `scp`, `rsync host:`, `nc`), mass-delete (`find -delete`,
+  `git clean -f`, `rsync --delete`, `shred`), and obfuscation shapes (pipe-to-shell,
+  `base64 -d`, `eval`, `sh -c`, `xargs rm`).
+
+### Changed
+- **Command chains are split** on `&&`, `||`, `;`, `|` and each segment is evaluated
+  independently; bypass patterns match per-segment, not anywhere in the whole command.
+- **Shell-aware parsing** — targets tokenized with `shlex` and expanded (`~`, `$HOME`,
+  `$PWD`), closing evasions like quoted `rm -rf "$HOME"` and `rm -rf ./`.
+- `AEGMIS_BLOCKED_PATHS` and the workspace / self-protect gates apply in **both**
+  forward-all and local mode.
+- README documents the trust model: Codex trusts a command hook by **hash**, so the hook
+  must be re-trusted after any update or it is skipped (fails open) until then.
+
+### Notes
+- The block contract was already fail-closed (exit 0 + `permissionDecision:"deny"`, with
+  a crash guard); no change was needed there.
+
+## [0.0.4] - 2026-07-12
 
 ### Added
 - `AEGMIS_BLOCKED_PATHS` — **hard local deny** for `rm`: a matching deletion is blocked
