@@ -43,7 +43,42 @@ fetch() {
   fi
 }
 
+# ── Preflight: Codex must be recent enough to support PreToolUse hooks ────────
+# Codex shipped its Claude-style lifecycle-hooks engine (incl. PreToolUse, which
+# is what lets this gate BLOCK a tool call) in early 2026. Older Codex silently
+# ignores the hooks.json config — the gate would be absent with no error. Warn
+# loudly rather than give a false sense of protection.
+check_codex_version() {
+  if ! command -v codex &>/dev/null; then
+    echo "⚠  'codex' not found on PATH — cannot verify hook support."
+    echo "   Install/updated Codex, then confirm PreToolUse hooks are supported."
+    return
+  fi
+  local ver
+  ver="$(codex --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 || true)"
+  echo "→ Detected Codex version: ${ver:-unknown}"
+  if [ -z "$ver" ]; then
+    echo "⚠  Could not parse the Codex version. PreToolUse hooks require a build"
+    echo "   from ~March 2026 or later; on older builds this gate does NOT run."
+    return
+  fi
+  local major minor
+  major="${ver%%.*}"
+  minor="$(printf '%s' "$ver" | cut -d. -f2)"
+  # Hooks first shipped around the 0.114 line; PreToolUse landed shortly after.
+  if [ "$major" = "0" ] && [ "${minor:-0}" -lt 114 ]; then
+    echo "✗ Codex $ver is too old — PreToolUse hooks are unsupported, so this"
+    echo "  gate would be SILENTLY INACTIVE. Upgrade Codex before relying on it."
+    echo "  (Set AEGMIS_SKIP_VERSION_CHECK=1 to install anyway.)"
+    if [ "${AEGMIS_SKIP_VERSION_CHECK:-0}" != "1" ]; then
+      exit 1
+    fi
+  fi
+}
+
 # ── Install hook script ──────────────────────────────────────────────────────
+
+check_codex_version
 
 echo "→ Creating hooks directory: $HOOKS_DIR"
 mkdir -p "$HOOKS_DIR"
@@ -131,7 +166,15 @@ echo "  Next steps:"
 echo "  1. Edit $ENV_FILE with your API key"
 echo "  2. Add  source $ENV_FILE  to ~/.zshrc (or ~/.bashrc)"
 echo "  3. Restart Codex so it reloads ~/.codex/hooks.json"
-echo "  4. Ask Codex to run a gated command (e.g. git push)"
+echo "  4. TRUST THE HOOK when Codex prompts — Codex will not run a command"
+echo "     hook until you review and trust its exact definition. Until then the"
+echo "     gate is INACTIVE (fails open)."
+echo "  5. Ask Codex to run a gated command (e.g. git push)"
+echo ""
+echo "  ⚠  RE-TRUST ON UPDATE: Codex records trust against the hook's hash. If"
+echo "     you re-run this installer or the hook.py changes, Codex will skip the"
+echo "     hook (gate OFF) until you trust it again. Re-confirm trust after every"
+echo "     update, and re-check gating with a known-gated command."
 echo ""
 echo "  NOTE: user-level hooks live in ~/.codex/. Project-local hooks"
 echo "        (<repo>/.codex/hooks.json) only load when the project is trusted."

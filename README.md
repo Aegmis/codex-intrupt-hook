@@ -50,10 +50,21 @@ dir itself routes to approval (`AEGMIS_PROTECTED_PATHS=re:^$HOME$`). To make a p
 
 ## Prerequisites
 
-- Codex CLI with hooks support (`~/.codex/hooks.json` or `[hooks]` in `config.toml`)
+- **Codex CLI new enough to support `PreToolUse` hooks.** Codex shipped its
+  Claude-style lifecycle-hooks engine in early 2026 (~the 0.114 line); older
+  builds **silently ignore** `hooks.json`, so the gate would be absent with no
+  error. `install.sh` checks your version and refuses on builds it knows are too
+  old (override with `AEGMIS_SKIP_VERSION_CHECK=1`).
 - Python 3.10+
 - An [Aegmis](https://aegmis.com) account with an API key
 - Slack workspace connected to your Aegmis org (for the default channel)
+
+> **⚠ You must _trust_ the hook, and re-trust it after every update.** Codex will
+> not run a command hook until you review and trust its exact definition, and it
+> records that trust against the hook's **hash**. If `hook.py` or the command
+> changes (e.g. you re-run the installer), Codex **skips the hook** — the gate is
+> off — until you trust it again. After any update, re-confirm trust and re-test
+> with a known-gated command (e.g. `git push`).
 
 ---
 
@@ -428,9 +439,35 @@ You should see a Slack message appear within a few seconds.
 
 ---
 
+## Defense in depth — pair the hook with Codex's sandbox & rules
+
+This hook gates the agent's **declared** tool calls by matching a command string,
+so a determined agent can evade a pattern denylist. Codex already ships stronger,
+OS-level controls — run the gate alongside them:
+
+- **Sandbox:** keep the default `workspace-write` mode. Writes are confined to the
+  workspace, `.git`/`.codex` stay read-only, and **network is off by default** —
+  which shuts down the "push the codebase somewhere public" class outright. Only
+  raise to `danger-full-access` inside an already-isolated container.
+- **execpolicy `.rules`:** for actions that must **never** run (no human should
+  even be asked), add a `forbidden` rule in `~/.codex/rules/default.rules`. Codex
+  splits `&&`/`||`/`;`/`|` chains and applies most-restrictive-wins, so this is a
+  robust hard-deny for `rm` of the project/home and for exfil verbs.
+
+Think of it as: **sandbox = the wall, `forbidden` rules = tripwires that never
+ask, this hook = the doorbell for the ambiguous middle.**
+
 ## Security notes
 
-- The hook **fails closed**: if the API is unreachable, the env vars are missing, the request times out, or the hook itself crashes, the tool call is denied — not allowed.
+- The hook **fails closed**: on reject, timeout, unreachable API, missing config,
+  or a crash, the tool call is **denied** (exit 0 + a `permissionDecision:"deny"`
+  decision — the block form Codex honors; an exit-2-with-empty-stderr would be
+  read as a hook *failure* and would **not** block).
+- **Workspace & self-protection always apply** (both modes): wiping the project
+  dir or an ancestor (`rm -rf .`, `rm -rf "$HOME"`, `find . -delete`, `git clean -fdx`)
+  is gated, and shell edits to the hook's own config (`~/.codex/…`) are gated.
+- Command **chains are split** (`&&`, `||`, `;`, `|`) and judged per segment, so a
+  benign first command can't shield a risky one.
 - `AEGMIS_API_KEY` is sent as a `Bearer` token. Keep it out of your shell history and `.bashrc` — use a secrets manager or the `.env.intrupt` file with `600` permissions.
 - The hook never stores or logs the tool input beyond what is sent to the API.
 

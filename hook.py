@@ -8,20 +8,21 @@ human decides.
 
 Codex hook contract (PreToolUse):
   - stdin  : JSON with tool_name, tool_input, session_id, cwd, ...
-             Shell commands arrive as tool_name "Bash" with tool_input.command.
+             Shell commands arrive with tool_name "Bash" (Codex canonicalizes
+             shell_command / exec_command / unified_exec to "Bash" for hooks).
              File edits arrive as tool_name "apply_patch" with the patch text in
-             tool_input.command.
-  - stdout : print
+             tool_input.command (matcher aliases Write/Edit also map here).
+  - BLOCK  : print
                {"hookSpecificOutput": {"hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": "..."}}
-             to BLOCK. Print {} (empty JSON) to allow / defer to normal flow.
-  - exit 0 : stdout parsed as JSON (the path used here).
+                "permissionDecision": "deny", "permissionDecisionReason": "..."}}
+             and exit 0. (Exit 0 + this JSON is the safe block form; exit 2 with
+             an EMPTY stderr is treated by Codex as a hook *failure*, which does
+             NOT block — so we always use the JSON-deny form here.)
+  - ALLOW  : print {} and exit 0 (defer to Codex's own approval flow).
 
 This hook is purely ADDITIVE: on approve / non-gated calls it emits {} and
-exits 0, deferring to Codex's own approval flow. On reject / timeout / error it
-emits a "deny" decision (fail closed). Any unexpected exception is also
-converted to a deny, since Codex treats a crashed hook as fail-OPEN otherwise.
+exits 0. On reject / timeout / error / crash it emits a "deny" decision (fail
+closed) — a crashed hook would otherwise fail OPEN in Codex.
 
 Environment variables (required):
   AEGMIS_BASE_URL   Base URL of the intrupt approval API (e.g. https://api.aegmis.com)
@@ -34,15 +35,19 @@ Optional:
                            policy engine and let server-side policies decide
                            (unmatched calls are auto-approved). If false, use the
                            local SHELL_GATE_PATTERNS pre-filter for shell commands.
-  AEGMIS_TIMEOUT         Max seconds to wait for a decision. Default: 600 (10 min)
+                           A few hard local gates (workspace wipe, self-protection,
+                           AEGMIS_BLOCKED_PATHS) always apply, in BOTH modes.
+  AEGMIS_TIMEOUT         Max seconds to wait for a decision. Default: 600 (10 min).
+                           Keep it below the Codex hook `timeout` (config sets 630).
   AEGMIS_POLL_INTERVAL   Seconds between status polls. Default: 5
   AEGMIS_BYPASS_PATTERNS Comma-separated regex patterns for shell commands that
-                           skip approval (allow-list). Applied in both modes.
+                           skip approval (allow-list). Matched per command segment.
 """
 
 import json
 import os
 import re
+import shlex
 import sys
 import time
 import uuid
@@ -56,20 +61,12 @@ BASE_URL       = os.environ.get("AEGMIS_BASE_URL", "https://api.aegmis.com").rst
 API_KEY        = os.environ.get("AEGMIS_API_KEY", "")
 TIMEOUT        = int(os.environ.get("AEGMIS_TIMEOUT", "600"))
 POLL_INTERVAL  = int(os.environ.get("AEGMIS_POLL_INTERVAL", "5"))
-# Approval delivery channel: "slack" (default) or "email".
 CHANNEL        = os.environ.get("AEGMIS_CHANNEL", "slack")
 
-# When true (default), forward every gated tool call to the Aegmis policy
-# engine and let server-side policies decide — unmatched calls are auto-approved.
-# When false, fall back to the local SHELL_GATE_PATTERNS pre-filter below and
-# only forward shell commands that match a risk pattern.
 FORWARD_ALL = os.environ.get("AEGMIS_FORWARD_ALL", "true").lower() in ("1", "true", "yes")
-
-# Kill switch: AEGMIS_APPROVAL=false disables the gate entirely (allow all).
 APPROVAL_ENABLED = os.environ.get("AEGMIS_APPROVAL", "true").lower() not in ("0", "false", "no", "off", "disable", "disabled")
 
-# Codex tool names. Shell commands report tool_name "Bash"; file edits report
-# tool_name "apply_patch" (both carry the payload in tool_input.command).
+# Codex tool names (hook layer). Shell → "Bash"; file edits → "apply_patch".
 SHELL_TOOL = "Bash"
 PATCH_TOOL = "apply_patch"
 
@@ -79,49 +76,79 @@ GATED_TOOLS = {
     if t.strip()
 }
 
-# Shell commands matching ANY of these patterns require approval.
-# Keep patterns specific to reduce interruption noise.
+_HOME = os.path.expanduser("~")
+
+# Shell commands matching ANY of these patterns require approval. Evaluated per
+# command SEGMENT (a chain like `a && b | c ; d` is split on && || ; & and
+# newlines; pipelines stay intact) so a benign command can't shield a risky one.
 SHELL_GATE_PATTERNS: list[str] = [
-    # Catastrophic deletions only — home/root/system dirs or a bare */./..  Routine
-    # and project-local deletes (rm file, rm -rf node_modules/build) pass through.
     r"\brm\b[\s\S]*\s(~/?(\s|$)|\$\{?HOME\}?/?(\s|$)|/(\s|$)|/\*|/(Users|home)/[^/\s]+/?(\s|$)|/(etc|usr|var|bin|sbin|opt|System|Library|private|boot|dev|lib|sys|proc)(/|\s|$)|\*(\s|$)|\.(\s|$)|\.\.(/|\s|$))",
-    r"\bgit\s+push\b",             # any git push (including --force)
+    # ── Destructive / mass deletes beyond plain rm ─────────────────────────────
+    r"\bfind\b[\s\S]*\s-delete\b",
+    r"\bfind\b[\s\S]*-exec\s+rm\b",
+    r"\bgit\s+clean\s+-[a-z]*f",
+    r"\brsync\b[\s\S]*--delete\b",
+    r"\bshred\b",
+    r"\bunlink\b\s",
+    # ── History / repo rewrites ────────────────────────────────────────────────
     r"\bgit\s+reset\s+--hard\b",
+    r"\bgit\s+(rebase|filter-branch|filter-repo)\b",
+    r"\bgit\s+branch\s+-D\b",
+    # ── Code / data egress (exfiltration) ──────────────────────────────────────
+    r"\bgit\s+push\b",
+    r"\bgit\s+remote\s+(add|set-url)\b",
+    r"\bgh\s+repo\s+create\b",
+    r"\bgh\s+repo\s+edit\b[\s\S]*--visibility",
+    r"\bgh\s+gist\s+create\b",
     r"\bgh\s+pr\s+merge\b",
     r"\bgh\s+release\b",
+    r"\bcurl\b[\s\S]*(\s-T\b|--upload-file\b|\s-F\b|--form\b|--data-binary\s*@|\s-d\s*@|--data\s*@)",
+    r"\bwget\b[\s\S]*--post-file\b",
+    r"\bscp\b\s",
+    r"\brsync\b[\s\S]*\s[^\s]+@[^\s:]+:",
+    r"\b(nc|ncat|netcat)\b\s",
+    # ── Publish / release / deploy ─────────────────────────────────────────────
     r"\bnpm\s+publish\b",
+    r"\b(pip|twine)\s+upload\b|\btwine\s+upload\b",
+    r"\b(cargo\s+publish|gem\s+push|poetry\s+publish)\b",
+    r"\bdocker\s+(push|login)\b",
     r"\bdeploy\b",
     r"\bkubectl\s+delete\b",
     r"\bkubectl\s+apply\b",
     r"\bterraform\s+apply\b",
     r"\bterraform\s+destroy\b",
-    r"DROP\s+TABLE",
+    # ── Database ───────────────────────────────────────────────────────────────
+    r"DROP\s+(TABLE|DATABASE|SCHEMA)",
     r"TRUNCATE\s+TABLE",
-    r"\bdd\s+if=",                 # disk operations
-    r"\bmkfs\b",
+    # ── Disk / device ──────────────────────────────────────────────────────────
+    r"\bdd\s+if=",
+    r"\b(mkfs|wipefs|fdisk)\b",
+    r">\s*/dev/(sd|nvme|disk|hd)",
+    # ── Privilege / perms ──────────────────────────────────────────────────────
     r"\bsudo\b",
-    r"\bchmod\s+[0-7]*7[0-7][0-7]\b",  # world-writable
+    r"\bchmod\s+[0-7]*7[0-7][0-7]\b",
     r"\bchown\b.*root",
-    r"\bcurl\b.*\|\s*(ba)?sh\b",   # pipe to shell
-    r"\bwget\b.*-O\s*-\b.*\|\s*(ba)?sh\b",
+    # ── Remote-to-shell & obfuscation ──────────────────────────────────────────
+    r"\|\s*(ba|z|k)?sh\b",
+    r"\bbase64\b[\s\S]*(-d|-D|--decode)\b",
+    r"\beval\b",
+    r"\b(ba|z|k)?sh\s+-c\b",
+    r"\bxargs\b[\s\S]*\brm\b",
+    r"\bpython[0-9.]*\b[\s\S]*-c\b[\s\S]*(rmtree|os\.remove|os\.unlink|shutil)",
+    r"\bperl\b[\s\S]*-e\b[\s\S]*unlink",
 ]
 
-# Compile once at startup
-# User-defined protected paths (AEGMIS_PROTECTED_PATHS) — also gate `rm` of each
-# listed path and anything under it, on top of the built-in catastrophic targets.
 for _pp in os.environ.get("AEGMIS_PROTECTED_PATHS", "").split(","):
     _pp = _pp.strip()
-    if _pp and not _pp.startswith("re:"):   # literal entry -> raw-command fallback pattern
+    if _pp and not _pp.startswith("re:"):
         SHELL_GATE_PATTERNS.append(r"\brm\b[\s\S]*\s" + re.escape(_pp.rstrip("/")) + r"(/|\s|$)")
 
 _COMPILED = [re.compile(p, re.IGNORECASE) for p in SHELL_GATE_PATTERNS]
 
-# Protected paths (AEGMIS_PROTECTED_PATHS) resolved for cwd-aware matching — this
-# catches relative rm targets (./ok, ok, ../x) that literal patterns would miss.
+_SEG_SPLIT = re.compile(r"&&|\|\||;|&(?!&)|\n")
+
 _STATE = {"cwd": ""}
-# Each AEGMIS_PROTECTED_PATHS entry is a LITERAL dir (dir + everything under it) or,
-# when prefixed "re:", a REGEX tested against the resolved absolute rm target (anchor
-# with ^...$ to match a dir exactly; alternation / lookahead supported).
+
 _PROTECTED_LITERAL = []
 _PROTECTED_REGEX = []
 for _pp in os.environ.get("AEGMIS_PROTECTED_PATHS", "").split(","):
@@ -137,9 +164,6 @@ for _pp in os.environ.get("AEGMIS_PROTECTED_PATHS", "").split(","):
     else:
         _PROTECTED_LITERAL.append(os.path.normpath(os.path.expanduser(_pp.rstrip("/"))))
 
-# Hard-blocked paths (AEGMIS_BLOCKED_PATHS) — same syntax as AEGMIS_PROTECTED_PATHS
-# (literal dir + subtree, or "re:" regex), but an `rm` hitting one is DENIED locally
-# with no approval round-trip. Local mode only (mirrors the protected-path gate).
 _BLOCKED_LITERAL = []
 _BLOCKED_REGEX = []
 for _pp in os.environ.get("AEGMIS_BLOCKED_PATHS", "").split(","):
@@ -155,19 +179,61 @@ for _pp in os.environ.get("AEGMIS_BLOCKED_PATHS", "").split(","):
     else:
         _BLOCKED_LITERAL.append(os.path.normpath(os.path.expanduser(_pp.rstrip("/"))))
 
+# Self-protection: writes/deletes/edits touching the hook's own config are always
+# gated, regardless of AEGMIS_GATED_TOOLS.
+_SELF_PROTECT = [
+    os.path.normpath(os.path.join(_HOME, ".codex")),
+]
+_SELF_PROTECT_SUFFIX = (
+    os.path.join(".codex", ""),
+    os.path.join(".git", "hooks"),
+)
+_MUTATING_VERB = re.compile(
+    r"\b(rm|mv|cp|tee|truncate|dd|chmod|chown|ln|install|touch)\b|\bsed\s+-i|>\s*\S|>>\s*\S"
+)
+
+
+def _tokenize(command: str) -> list[str]:
+    try:
+        return shlex.split(command, posix=True)
+    except ValueError:
+        return command.split()
+
+
+def _expand(path: str, cwd: str) -> str:
+    p = path
+    for var in ("${PWD}", "$PWD"):
+        p = p.replace(var, cwd or ".")
+    for var in ("${HOME}", "$HOME"):
+        p = p.replace(var, _HOME)
+    return os.path.expanduser(p)
+
+
+def _resolve(path: str, cwd: str) -> str:
+    p = _expand(path, cwd)
+    if not os.path.isabs(p):
+        p = os.path.join(cwd or ".", p)
+    return os.path.normpath(p).rstrip("/") or "/"
+
+
+def _path_tokens(command: str) -> list[str]:
+    out = []
+    for tok in _tokenize(command):
+        t = tok.lstrip("<>&|")
+        t = t.strip("'\"")
+        if not t or t.startswith("-") or t in ("rm", "sudo", "--", "mv", "cp",
+                                               "tee", "sed", "ln", "chmod", "chown",
+                                               "install", "touch", "cat", "&&", "||", ";", "|"):
+            continue
+        out.append(t)
+    return out
+
 
 def _rm_hits(command: str, literals: list, regexes: list) -> bool:
-    """True if an rm target (resolved against cwd) matches a literal path
-    (dir + subtree) or a `re:` regex (against the resolved absolute path)."""
     if (not literals and not regexes) or not re.search(r"\brm\b", command):
         return False
-    for tok in command.split():
-        t = tok.strip("'\"")
-        if not t or t in ("rm", "sudo", "--") or t.startswith("-"):
-            continue
-        t = os.path.expanduser(t)
-        cand = t if os.path.isabs(t) else os.path.normpath(os.path.join(_STATE["cwd"] or ".", t))
-        cand = os.path.normpath(cand).rstrip("/")
+    for t in _path_tokens(command):
+        cand = _resolve(t, _STATE["cwd"])
         for prot in literals:
             if cand == prot or cand.startswith(prot + "/"):
                 return True
@@ -178,16 +244,50 @@ def _rm_hits(command: str, literals: list, regexes: list) -> bool:
 
 
 def _rm_hits_protected(command: str) -> bool:
-    """True if an rm target matches a protected literal path or `re:` regex."""
     return _rm_hits(command, _PROTECTED_LITERAL, _PROTECTED_REGEX)
 
 
 def _rm_hits_blocked(command: str) -> bool:
-    """True if an rm target matches a hard-blocked literal path or `re:` regex."""
     return _rm_hits(command, _BLOCKED_LITERAL, _BLOCKED_REGEX)
 
 
-# Optional allow-list: patterns whose matching shell commands bypass approval
+def _rm_hits_workspace(command: str) -> bool:
+    """True if a delete targets the whole project — the working dir itself or any
+    ancestor (or filesystem root). Deleting a SUBDIR stays free."""
+    cwd = _STATE["cwd"]
+    if not cwd:
+        return False
+    if not re.search(r"\b(rm|find)\b", command):
+        return False
+    cwd_n = os.path.normpath(cwd).rstrip("/") or "/"
+    for t in _path_tokens(command):
+        cand = _resolve(t, cwd)
+        if cand == "/" or cand == cwd_n or cwd_n.startswith(cand + "/"):
+            return True
+    return False
+
+
+def _path_under_self_protect(cand: str) -> bool:
+    for prot in _SELF_PROTECT:
+        if cand == prot or cand.startswith(prot + "/"):
+            return True
+    norm = cand.replace("\\", "/")
+    for suffix in _SELF_PROTECT_SUFFIX:
+        s = suffix.replace("\\", "/").rstrip("/")
+        if norm == s or ("/" + s + "/") in (norm + "/") or norm.endswith("/" + s):
+            return True
+    return False
+
+
+def _hits_self_protect(command: str) -> bool:
+    if not _MUTATING_VERB.search(command):
+        return False
+    for t in _path_tokens(command):
+        if _path_under_self_protect(_resolve(t, _STATE["cwd"])):
+            return True
+    return False
+
+
 _BYPASS_RAW = os.environ.get("AEGMIS_BYPASS_PATTERNS", "")
 _BYPASS = [re.compile(p, re.IGNORECASE) for p in _BYPASS_RAW.split(",") if p.strip()]
 
@@ -195,13 +295,27 @@ _BYPASS = [re.compile(p, re.IGNORECASE) for p in _BYPASS_RAW.split(",") if p.str
 _PATCH_FILE_RE = re.compile(r"^\*\*\*\s+(?:Add|Update|Delete)\s+File:\s+(.+)$", re.MULTILINE)
 
 
+def _segments(command: str) -> list[str]:
+    segs = [s.strip() for s in _SEG_SPLIT.split(command) if s.strip()]
+    return segs or [command]
+
+
+def _segment_bypassed(seg: str) -> bool:
+    return any(b.search(seg) for b in _BYPASS)
+
+
+def _fully_bypassed(command: str) -> bool:
+    if not _BYPASS:
+        return False
+    return all(_segment_bypassed(s) for s in _segments(command))
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _extract_org_id(api_key: str) -> str:
-    """Extract org_id from API key format: sk_org_{org_id}_{hash}."""
     if not api_key.startswith("sk_org_"):
         _die("Invalid AEGMIS_API_KEY format — expected 'sk_org_{org_id}_{hash}'")
-    after_prefix = api_key[7:]  # strip "sk_org_"
+    after_prefix = api_key[7:]
     last_underscore = after_prefix.rfind("_")
     if last_underscore == -1:
         _die("Invalid AEGMIS_API_KEY format — expected 'sk_org_{org_id}_{hash}'")
@@ -212,7 +326,6 @@ def _extract_org_id(api_key: str) -> str:
 
 
 def _api(method: str, path: str, body: Optional[dict] = None) -> dict:
-    """Minimal HTTP client using only stdlib — no dependencies required."""
     url  = f"{BASE_URL}{path}"
     data = json.dumps(body).encode() if body else None
     req  = urllib.request.Request(
@@ -222,8 +335,6 @@ def _api(method: str, path: str, body: Optional[dict] = None) -> dict:
         headers={
             "Content-Type":  "application/json",
             "Authorization": f"Bearer {API_KEY}",
-            # Cloudflare returns HTTP 403 "error code: 1010" for the default
-            # Python-urllib User-Agent (banned browser signature). Send a real one.
             "User-Agent":    "intrupt-hook/1.0",
         },
     )
@@ -238,17 +349,14 @@ def _api(method: str, path: str, body: Optional[dict] = None) -> dict:
 
 
 def _allow() -> None:
-    """Defer to Codex's normal flow — emit empty JSON, exit 0.
-
-    An empty object carries no decision, so Codex's own approval flow still
-    applies. This hook only ever ADDS a gate.
-    """
+    """Defer to Codex's normal flow — emit empty JSON, exit 0."""
     print("{}", flush=True)
     sys.exit(0)
 
 
 def _block(reason: str) -> None:
-    """Deny the tool call. reason is surfaced to the agent as the decision reason."""
+    """Deny the tool call. Exit 0 + JSON-deny is the safe block form in Codex
+    (exit 2 with empty stderr is treated as a hook FAILURE and does not block)."""
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName":            "PreToolUse",
@@ -260,36 +368,44 @@ def _block(reason: str) -> None:
 
 
 def _die(msg: str) -> None:
-    """Fatal error — deny the tool call and report why (fail closed)."""
     _block(f"[intrupt hook error] {msg}")
 
 
-def _bypassed(command: str) -> bool:
-    """True if the command matches an allow-list bypass pattern."""
-    return any(b.search(command) for b in _BYPASS)
+def _hard_local_gate(command: str) -> bool:
+    """Local gates that ALWAYS apply (both modes). Returns True if approval is
+    required; may _block() directly for an outright deny."""
+    if _rm_hits_blocked(command):
+        _block("Deletion of a hard-blocked path is denied "
+               "(AEGMIS_BLOCKED_PATHS) — not sent for approval.")
+    if _rm_hits_workspace(command):
+        return True
+    if _hits_self_protect(command):
+        return True
+    return False
 
 
 def _should_gate_shell(command: str) -> bool:
-    """Gate if command matches any SHELL_GATE_PATTERNS and no BYPASS pattern."""
-    if _bypassed(command):
-        return False
-    if _rm_hits_protected(command):
-        return True
-    return any(p.search(command) for p in _COMPILED)
+    """Local-mode risk decision, evaluated per command segment."""
+    for seg in _segments(command):
+        if _segment_bypassed(seg):
+            continue
+        if _rm_hits_protected(seg):
+            return True
+        if any(p.search(seg) for p in _COMPILED):
+            return True
+    return False
 
 
 def _patch_files(patch: str) -> list[str]:
-    """Extract the file paths touched by an apply_patch payload."""
     return _PATCH_FILE_RE.findall(patch or "")
 
 
 # ── Main ────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    # 1. Parse stdin payload from Codex
     raw = sys.stdin.read()
     if not APPROVAL_ENABLED:
-        _allow()  # AEGMIS_APPROVAL disabled — allow without gating
+        _allow()
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
@@ -303,27 +419,23 @@ def main() -> None:
         try:
             tool_input = json.loads(tool_input)
         except json.JSONDecodeError:
-            tool_input = {"raw": tool_input}
+            tool_input = {"command": tool_input}
     if not isinstance(tool_input, dict):
         tool_input = {"value": tool_input}
 
-    # 2. Decide whether to gate this call
     if tool_name not in GATED_TOOLS:
-        _allow()  # not gated — defer to normal flow immediately
+        _allow()
 
     if tool_name == SHELL_TOOL:
         command = tool_input.get("command", "")
-        if FORWARD_ALL:
-            # Forward everything to the policy engine, but let the local
-            # allow-list still short-circuit known-safe commands.
-            if _bypassed(command):
-                _allow()
-        else:
-            if _rm_hits_blocked(command):
-                _block("Deletion of a hard-blocked path is denied "
-                       "(AEGMIS_BLOCKED_PATHS) — not sent for approval.")
-            if not _should_gate_shell(command):
-                _allow()  # low-risk command — allow locally
+        # Hard local gates apply in BOTH modes (deny / always-ask).
+        if not _hard_local_gate(command):
+            if FORWARD_ALL:
+                if _fully_bypassed(command):
+                    _allow()
+            else:
+                if not _should_gate_shell(command):
+                    _allow()
         action  = "bash_command"
         message = f"Run: `{command.splitlines()[0][:120] if command else ''}`"
 
@@ -338,14 +450,12 @@ def main() -> None:
         action  = tool_name.lower()
         message = f"Codex wants to call `{tool_name}`"
 
-    # 3. Validate config before making any API calls
     if not API_KEY:
         _die("AEGMIS_API_KEY is not set")
     org_id = _extract_org_id(API_KEY)
 
-    thread_id = str(uuid.uuid4())  # unique per hook invocation
+    thread_id = str(uuid.uuid4())
 
-    # 4. Create the approval request
     resp = _api("POST", f"/org/{org_id}/approval", {
         "thread_id":   thread_id,
         "action":      action,
@@ -356,35 +466,26 @@ def main() -> None:
         "adapter":     "codex",
     })
 
-    # The API may decide inline (e.g. auto-approve when no policy matches),
-    # returning a terminal status immediately. Honor it before polling.
     status = resp.get("status", "pending")
     if status == "approved":
         _allow()
     if status in ("rejected", "denied"):
         _block(f"Approval rejected (status={status})")
 
-    # Otherwise a human must decide — grab the id to poll on.
     approval_id = resp.get("approval_id") or resp.get("audit_id")
     if not approval_id:
         _die(f"API did not return approval_id/audit_id: {resp}")
 
-    # 5. Poll until decided or timeout
     deadline = time.monotonic() + TIMEOUT
     while time.monotonic() < deadline:
         time.sleep(POLL_INTERVAL)
         status_resp = _api("GET", f"/org/{org_id}/approval/{approval_id}")
         status = status_resp.get("status", "pending")
-
         if status == "approved":
-            _allow()  # Codex proceeds with the tool call
-
+            _allow()
         if status in ("rejected", "denied"):
             _block(f"Approval rejected by approver (approval_id={approval_id})")
 
-        # status == "pending" → keep polling
-
-    # Timeout — fail closed
     _block(
         f"Approval timed out after {TIMEOUT}s — tool call blocked "
         f"(approval_id={approval_id}). Approve or reject it in the dashboard."
@@ -397,6 +498,4 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except BaseException as exc:  # noqa: BLE001 — fail closed on ANY crash
-        # Codex treats a crashed hook (non-zero exit) as fail-OPEN, so convert
-        # any unexpected error into an explicit deny decision.
         _block(f"[intrupt hook error] unexpected failure: {exc!r}")
